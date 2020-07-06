@@ -1,32 +1,49 @@
 """Publish entries to GitHub."""
 import datetime
+import io
+import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import diskcache
 import github
 import pandas as pd
 
 from .. import config
-from ..util.str import readable_list
 from ._base import BasePublisher
+
+log = logging.getLogger(__name__)
 
 
 class Publication:
 
     CURRENT_VERSION = 1
 
-    def __init__(self, df_entries: pd.DataFrame):
-        self.df_entries = df_entries
-        self.date_utc = datetime.datetime.utcnow().date()
+    def __init__(self, channel: str, df_entries: pd.DataFrame, sha: Optional[str]):
+        self.dt_utc = datetime.datetime.utcnow()
         self.version = self.CURRENT_VERSION
+
+        self.channel = channel
+        self.df_entries = df_entries
+        self.sha = sha
+
+    @property
+    def summary(self) -> str:
+        feed_counts = ", ".join(f"{value}={count}" for value, count in self.df_entries["feed"].value_counts().iteritems())
+        return f"{self.channel}={len(self.df_entries)}: {feed_counts}"
 
     @property
     def entries_csv(self) -> str:
         assert not self.df_entries.empty
-        return self.df_entries.to_csv(index=False)
+        entries_csv = self.df_entries.to_csv(index=False)
+        assert self.df_entries.equals(self.from_entries_csv(channel=self.channel, entries_csv=entries_csv))
+        return entries_csv
+
+    @classmethod
+    def from_entries_csv(cls, channel: str, entries_csv: str) -> 'Publication':
+        return cls(channel=channel, df_entries=pd.read_csv(io.StringIO(entries_csv), parse_dates=["dt_utc"]))
 
     @property
     def is_version_current(self) -> bool:
@@ -35,6 +52,10 @@ class Publication:
         This check can be relevant after restoring a pickled instance.
         """
         return self.version == self.CURRENT_VERSION
+
+    @property
+    def path(self) -> str:
+        return f"{self.channel}/{self.dt_utc.strftime('%Y/%m%d/%H')}.csv"  # Ref: https://strftime.org/
 
 
 class Publisher(BasePublisher):
@@ -48,30 +69,41 @@ class Publisher(BasePublisher):
 
     def _publish(self, channel: str, df_entries: pd.DataFrame) -> Dict[str, Any]:
         assert not df_entries.empty
-        pub = Publication(df_entries)
-        path = f"{channel}/{pub.date_utc.strftime('%Y/%m%d')}.csv"  # Ref: https://strftime.org/
-        new_feed_counts = readable_list([f"{count} {value}" for value, count in df_entries["feed"].value_counts().iteritems()])
-        commit_message = f"Add {new_feed_counts} entries of {channel}"
+        pub = Publication(channel=channel, df_entries=df_entries)
+        response = None
 
-        # Merge with day's history
-        if (cached_pub := self._cache.get(channel)) and pub.is_version_current and pub.date_utc == cached_pub.date_utc:
-            # Merge with disk cache
-            pub.df_entries = pd.concat((cached_pub.df_entries, pub.df_entries))
-            pub.sha = self._repo.update_file(path=path, message=commit_message, content=pub.entries_csv, sha=cached_pub.sha)["content"].sha
-            self._cache[channel] = pub
-        else:
+        # Try updating file, appending to previously disk-cached content
+        if (cached_pub := self._cache.get(channel)) and cached_pub.is_version_current and pub.path == cached_pub.path:
+            cached_pub.df_entries = pd.concat((cached_pub.df_entries, pub.df_entries))  # pub is intentionally not updated here instead.
+            assert not cached_pub.df_entries.duplicated().any()
             try:
-                # Update content
-                pub.sha = self._repo.get_contents(path=path)["content"].sha
-            except github.GithubException.UnknownObjectException:
-                # Create content
-                pub.sha = self._repo.create_file(path=path, message=commit_message, content=pub.entries_csv)["content"].sha
-            self._cache[channel] = pub
+                response = self._repo.update_file(path=cached_pub.path, message=cached_pub.summary, content=cached_pub.entries_csv, sha=cached_pub.sha)
+            except github.GithubException:
+                log.warning("")
+            else:
+                pub = cached_pub
 
-        content = df_entries.to_csv(index=False)
-        self._repo.create_file(path=path, message=commit_message, content=content)
+        # Try creating file
+        if not response:
+            try:
+                response = self._repo.create_file(path=pub.path, message=pub.summary, content=pub.entries_csv)
+            except github.GithubException:
+                log.debug("")
+
+        # Try updating file, appending to previously published content
+        if not response:
+            response = self._repo.get_contents(path=pub.path)
+            stored_pub = Publication.from_entries_csv(channel=channel, entries_csv=response.decoded_content.decode())
+            pub.df_entries = pd.concat((stored_pub, pub.df_entries))
+            assert not pub.df_entries.duplicated().any()
+            response = self._repo.update_file(path=pub.path, message=pub.summary, content=pub.entries_csv, sha=response.sha)
+
+        # Update disk-cache
+        pub.sha = response["content"].sha
+        self._cache[channel] = pub
+
         return {
-            "path": path,
+            "path": pub.path,
             # "content_len": len(content),
             "rate_remaining": self._github.rate_limiting[0],
             # "rate_limit": self._github.rate_limiting[1],  # Always 5000.

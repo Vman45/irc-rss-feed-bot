@@ -50,7 +50,9 @@ class BasePublisher(abc.ABC):
             dt_utc = datetime.datetime.utcnow()
             entries_gen = ({"dt_utc": dt_utc, "feed": e.feed_reader.name, "title": e.title, "long_url": e.long_url, "short_url": e.short_url} for e in entries)
             # Note: `"channel": e.feed_reader.channel` is intentionally not included.
-            return pd.DataFrame(entries_gen)
+            df = pd.DataFrame(entries_gen)
+            assert not df.duplicated().any()
+            return df
 
     @abc.abstractmethod
     def _publish(self, channel: str, df_entries: pd.DataFrame) -> Dict[str, Any]:
@@ -61,10 +63,12 @@ class BasePublisher(abc.ABC):
 
         This method must be called only when one or both of `entries` and `self._publish_queue.pop(channel, None)` are not None.
         """
-        df_entries = self.entries_df(entries)
+        df_entries = self.entries_df(entries)  # Empty if called by self.drain.
+        assert not df_entries.duplicated().any()
         with self._publish_lock:
             df_entries = pd.concat((self._publish_queue.pop(channel, None), df_entries))  # Requires channel-level or broader lock. Raises ValueError if both are None.
             assert not df_entries.empty
+            assert not df_entries.duplicated().any()
             num_entries = len(df_entries)
             for num_attempt in itertools.count(start=1):
                 desc_minimal = f"{num_entries:,} entries of {channel} to {self.name}"
